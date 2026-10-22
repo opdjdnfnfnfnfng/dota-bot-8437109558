@@ -1,6 +1,6 @@
 {
   "version": 7,
-  "last_sync": "2026-10-22T11:47:44.810707",
+  "last_sync": "2026-10-22T11:47:50.264665",
   "github_user": "opdjdnfnfnfnfng",
   "github_repo": "dota-bot-8437109558",
   "bots": [
@@ -11,6 +11,10 @@
       "is_main": true
     }
   ],
-  "users": {},
+  "users": {
+    "8043772198": {
+      "first_seen": "2026-10-22T11:47:50.264657"
+    }
+  },
   "ig_ids": []
 }
