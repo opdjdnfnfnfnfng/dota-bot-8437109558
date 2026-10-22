@@ -1,6 +1,6 @@
 {
   "version": 7,
-  "last_sync": "2026-10-22T11:49:46.246740",
+  "last_sync": "2026-10-22T11:50:09.832965",
   "github_user": "opdjdnfnfnfnfng",
   "github_repo": "dota-bot-8437109558",
   "bots": [
@@ -32,7 +32,7 @@
       "added_at": "2026-10-22T11:49:21.916217",
       "stats": {
         "sent": 0,
-        "errors_total": 1,
+        "errors_total": 2,
         "errors_current": 1
       }
     }
