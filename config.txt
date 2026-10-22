@@ -1,6 +1,6 @@
 {
   "version": 7,
-  "last_sync": "2026-10-22T13:22:52.109331",
+  "last_sync": "2026-10-22T13:23:14.161555",
   "github_user": "opdjdnfnfnfnfng",
   "github_repo": "dota-bot-8437109558",
   "bots": [
@@ -28,7 +28,7 @@
       "gc_name": "\u3018\ud83c\udf40\u3019\u200e\ud80c\udc83\ud835\udd84\u028a\u1d1b\uaadd\ud80c\udc83\u16d5\uaac0\u0274\u0262\ud80c\udc83H\uaadd\u026a\ud80c\udc83\u3018\ud83c\udf40\u3019",
       "text": "Hy",
       "running": true,
-      "proxy": "http://38.210.201.144:999",
+      "proxy": "http://103.155.198.138:3125",
       "added_at": "2026-10-22T13:02:07.048028",
       "stats": {
         "sent": 6,
