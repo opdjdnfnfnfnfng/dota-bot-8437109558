@@ -3,6 +3,7 @@
 
 import sys, os, subprocess, importlib, asyncio, json, base64, re, random, warnings, time, html, glob, shutil
 from datetime import datetime
+from collections import deque
 
 warnings.filterwarnings("ignore", category=UserWarning, module="telegram.ext.conversationhandler")
 
@@ -55,6 +56,7 @@ GITHUB_API       = "https://api.github.com"
 MAX_IG_PER_USER  = 4
 MAX_TG_PER_USER  = 2
 MAX_IG_PER_PROXY = 2
+POOL_TARGET      = 100
 
 S_TG_TOKEN, S_IG_USER, S_IG_PASS, S_IG_2FA, S_IG_TEXT, S_IG_CHALLENGE = range(6)
 S_ADD_BOT, S_BROADCAST = range(6, 8)
@@ -64,10 +66,14 @@ CONFIG = {}
 CONFIG_LOCK = asyncio.Lock()
 PROXY_POOL = set()
 PROXY_ASSIGN = {}
-PROXY_HEALTH = {}
 PROXY_LOCK = asyncio.Lock()
+ALIVE_PROXIES = {}
+ALIVE_LOCK = asyncio.Lock()
+_replenishing = False
 IG_TASKS = {}
 IG_CLIENTS = {}
+IG_LOGS = {}
+IG_START_TIME = {}
 TEMP = {}
 TEMP_TS = {}
 STOP_FLAG = False
@@ -76,7 +82,7 @@ GH_SESSION = None
 GH_DIRTY = False
 
 PROXY_SOURCES = [
-    "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&protocol=http&proxy_format=ipport&format=text",
+    "https://api.proxyscrape.com/v4/proxy-list/get?request=display_proxies&protocol=http&proxy_format=ipport&format=text",
     "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
     "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
     "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
@@ -131,6 +137,12 @@ def is_network_error(e):
     )
     return any(k in msg for k in keywords)
 
+def ig_log(username, level, msg):
+    if username not in IG_LOGS:
+        IG_LOGS[username] = deque(maxlen=10)
+    ts = datetime.now().strftime("%H:%M:%S")
+    IG_LOGS[username].append(f"{ts} {level} {msg}")
+
 async def safe_edit(q, text, *, reply_markup=None, parse_mode="HTML"):
     if len(text) > 3800:
         text = text[:3800] + "\n\n<i>... truncated</i>"
@@ -163,7 +175,6 @@ def load_config():
         CONFIG = default_config()
         save_config()
         return
-
     if not isinstance(loaded, dict):
         loaded = {}
     base = default_config()
@@ -284,7 +295,6 @@ async def gh_bootstrap():
             CONFIG["github_repo"] = REPO_NAME
             save_config()
             await asyncio.sleep(1)
-
         redacted = json.loads(json.dumps(CONFIG))
         for ig in redacted.get("ig_ids", []):
             if ig.get("password"):
@@ -292,7 +302,6 @@ async def gh_bootstrap():
             if ig.get("settings"):
                 ig["settings"] = {"_redacted": True}
         await gh_push_file(GH_SESSION, CONFIG_FILE, json.dumps(redacted, indent=2), "config")
-
         try:
             with open(__file__, "r", encoding="utf-8") as f:
                 mc = f.read()
@@ -320,25 +329,6 @@ async def gh_sync_loop():
                         ig["settings"] = {"_redacted": True}
                 if await gh_push_file(GH_SESSION, CONFIG_FILE, json.dumps(redacted, indent=2), "config"):
                     GH_DIRTY = False
-            if not IG_TASKS and not GH_DIRTY:
-                remote_text = await gh_pull_file(GH_SESSION, CONFIG_FILE)
-                if remote_text:
-                    try:
-                        rjson = json.loads(remote_text)
-                        if (rjson.get("last_sync") or "") > (CONFIG.get("last_sync") or ""):
-                            for r_ig in rjson.get("ig_ids", []):
-                                for l_ig in CONFIG.get("ig_ids", []):
-                                    if r_ig["username"] == l_ig["username"] and r_ig["owner_id"] == l_ig["owner_id"]:
-                                        if r_ig.get("password") == "REDACTED":
-                                            r_ig["password"] = l_ig.get("password")
-                                        if r_ig.get("settings") == {"_redacted": True}:
-                                            r_ig["settings"] = l_ig.get("settings")
-                            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-                                json.dump(rjson, f, indent=2)
-                            load_config()
-                            print("[SYNC] Pulled remote config")
-                    except:
-                        pass
         except:
             pass
 
@@ -366,32 +356,13 @@ def load_user_proxies():
                 p = parse_proxy(line)
                 if p:
                     PROXY_POOL.add(p)
-                    PROXY_HEALTH[p] = (time.time(), True)
+                    ALIVE_PROXIES[p] = time.time()
                     count += 1
     except Exception as e:
         print(f"[USER PROXY] {e}")
     if count:
-        print(f"[USER PROXY] Loaded {count} proxies from {USER_PROXY_FILE}")
+        print(f"[USER PROXY] Loaded {count} trusted proxies")
     return count
-
-async def proxy_fetcher():
-    while not STOP_FLAG:
-        try:
-            async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False)) as s:
-                for url in PROXY_SOURCES:
-                    try:
-                        async with s.get(url, timeout=10) as r:
-                            if r.status == 200:
-                                for l in (await r.text()).splitlines():
-                                    p = parse_proxy(l)
-                                    if p:
-                                        async with PROXY_LOCK:
-                                            PROXY_POOL.add(p)
-                    except:
-                        pass
-        except:
-            pass
-        await asyncio.sleep(30)
 
 async def fetch_proxies_now():
     async def fetch_one(s, url):
@@ -406,29 +377,13 @@ async def fetch_proxies_now():
                                 PROXY_POOL.add(p)
         except Exception:
             pass
-
     try:
         async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False)) as s:
             await asyncio.gather(*[fetch_one(s, u) for u in PROXY_SOURCES], return_exceptions=True)
     except Exception:
         pass
 
-async def quick_check_proxy(proxy, timeout=4):
-    try:
-        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False)) as s:
-            async with s.get(
-                "https://i.instagram.com/",
-                proxy=proxy,
-                timeout=aiohttp.ClientTimeout(total=timeout),
-                headers={"User-Agent": "Mozilla/5.0"},
-                allow_redirects=False,
-            ) as r:
-                return r.status < 500
-    except Exception:
-        return False
-
-async def ig_reachable_via(proxy, timeout=4):
-    """Verify proxy can reach Instagram specifically."""
+async def _test_proxy_fast(proxy, timeout=2):
     try:
         async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False)) as s:
             async with s.get(
@@ -442,35 +397,79 @@ async def ig_reachable_via(proxy, timeout=4):
     except Exception:
         return False
 
-async def mark_proxy_dead(proxy):
-    async with PROXY_LOCK:
-        PROXY_POOL.discard(proxy)
-        PROXY_ASSIGN.pop(proxy, None)
-    PROXY_HEALTH[proxy] = (time.time(), False)
-
-async def proxy_cleaner():
-    while not STOP_FLAG:
-        await asyncio.sleep(120)
+async def _replenish_pool():
+    global _replenishing
+    if _replenishing:
+        return
+    _replenishing = True
+    try:
+        await fetch_proxies_now()
+        async with ALIVE_LOCK:
+            already = set(ALIVE_PROXIES.keys())
         async with PROXY_LOCK:
-            sample = list(PROXY_POOL)[:300]
-        if not sample:
-            continue
-        results = await asyncio.gather(
-            *[quick_check_proxy(p, timeout=6) for p in sample],
-            return_exceptions=True,
-        )
-        dead = []
-        now = time.time()
-        for p, r in zip(sample, results):
-            alive = (r is True)
-            PROXY_HEALTH[p] = (now, alive)
-            if not alive:
-                dead.append(p)
-        if dead:
-            async with PROXY_LOCK:
-                for p in dead:
-                    PROXY_POOL.discard(p)
-                    PROXY_ASSIGN.pop(p, None)
+            candidates = [p for p in PROXY_POOL if p not in already]
+        if not candidates:
+            return
+        for i in range(0, len(candidates), 20):
+            if STOP_FLAG:
+                return
+            async with ALIVE_LOCK:
+                if len(ALIVE_PROXIES) >= POOL_TARGET:
+                    return
+            batch = candidates[i:i+20]
+            results = await asyncio.gather(*[_test_proxy_fast(p, timeout=3) for p in batch], return_exceptions=True)
+            for p, r in zip(batch, results):
+                if r is True:
+                    async with ALIVE_LOCK:
+                        ALIVE_PROXIES[p] = time.time()
+                    async with ALIVE_LOCK:
+                        if len(ALIVE_PROXIES) >= POOL_TARGET:
+                            return
+    except Exception as e:
+        print(f"[REPLENISH] {e}")
+    finally:
+        _replenishing = False
+
+async def proxy_maintainer():
+    print(f"[PROXY] Maintainer started (target={POOL_TARGET})")
+    await _replenish_pool()
+    while not STOP_FLAG:
+        try:
+            async with ALIVE_LOCK:
+                snapshot = list(ALIVE_PROXIES.keys())
+            if snapshot:
+                results = await asyncio.gather(
+                    *[_test_proxy_fast(p, timeout=1.5) for p in snapshot],
+                    return_exceptions=True
+                )
+                dead = []
+                for p, r in zip(snapshot, results):
+                    if r is not True:
+                        dead.append(p)
+                    else:
+                        async with ALIVE_LOCK:
+                            ALIVE_PROXIES[p] = time.time()
+                if dead:
+                    async with ALIVE_LOCK:
+                        for p in dead:
+                            ALIVE_PROXIES.pop(p, None)
+                    print(f"[PROXY] Dropped {len(dead)}, alive={len(ALIVE_PROXIES)}")
+            async with ALIVE_LOCK:
+                need = POOL_TARGET - len(ALIVE_PROXIES)
+            if need > 0:
+                asyncio.create_task(_replenish_pool())
+        except Exception as e:
+            print(f"[PROXY MNT] {e}")
+        await asyncio.sleep(1)
+
+async def get_alive_proxy(timeout=15):
+    start = time.time()
+    while time.time() - start < timeout:
+        async with ALIVE_LOCK:
+            if ALIVE_PROXIES:
+                return next(iter(ALIVE_PROXIES))
+        await asyncio.sleep(0.3)
+    return None
 
 async def release_proxy_for(username):
     async with PROXY_LOCK:
@@ -481,149 +480,73 @@ async def release_proxy_for(username):
                     del PROXY_ASSIGN[proxy]
                 return
 
-async def find_one_alive_proxy(username, max_check=60):
-    """FAST: return FIRST alive IG-reachable proxy."""
-    # Pass 1: cached alive
-    async with PROXY_LOCK:
-        for p in list(PROXY_POOL):
-            cached = PROXY_HEALTH.get(p)
-            if cached and cached[1] and time.time() - cached[0] < 180:
-                if len(PROXY_ASSIGN.get(p, [])) < MAX_IG_PER_PROXY:
-                    PROXY_ASSIGN.setdefault(p, []).append(username)
-                    return p
-
-    # Pass 2: existing untested
-    async with PROXY_LOCK:
-        untested = [
-            p for p in PROXY_POOL
-            if len(PROXY_ASSIGN.get(p, [])) < MAX_IG_PER_PROXY
-            and (p not in PROXY_HEALTH or not PROXY_HEALTH[p][1])
-        ][:max_check]
-
-    if untested:
-        for i in range(0, len(untested), 15):
-            batch = untested[i:i + 15]
-            results = await asyncio.gather(
-                *[ig_reachable_via(p, timeout=4) for p in batch],
-                return_exceptions=True,
-            )
-            for p, r in zip(batch, results):
-                alive = (r is True)
-                PROXY_HEALTH[p] = (time.time(), alive)
-                if alive:
-                    async with PROXY_LOCK:
-                        if len(PROXY_ASSIGN.get(p, [])) < MAX_IG_PER_PROXY:
-                            PROXY_ASSIGN.setdefault(p, []).append(username)
-                            return p
-                else:
-                    async with PROXY_LOCK:
-                        PROXY_POOL.discard(p)
-
-    # Pass 3: fetch fresh
-    await fetch_proxies_now()
-    await asyncio.sleep(0.3)
-
-    async with PROXY_LOCK:
-        fresh = [
-            p for p in PROXY_POOL
-            if len(PROXY_ASSIGN.get(p, [])) < MAX_IG_PER_PROXY
-            and (p not in PROXY_HEALTH or not PROXY_HEALTH[p][1])
-        ][:max_check]
-
-    if fresh:
-        for i in range(0, len(fresh), 15):
-            batch = fresh[i:i + 15]
-            results = await asyncio.gather(
-                *[ig_reachable_via(p, timeout=4) for p in batch],
-                return_exceptions=True,
-            )
-            for p, r in zip(batch, results):
-                alive = (r is True)
-                PROXY_HEALTH[p] = (time.time(), alive)
-                if alive:
-                    async with PROXY_LOCK:
-                        if len(PROXY_ASSIGN.get(p, [])) < MAX_IG_PER_PROXY:
-                            PROXY_ASSIGN.setdefault(p, []).append(username)
-                            return p
-                else:
-                    async with PROXY_LOCK:
-                        PROXY_POOL.discard(p)
-
-    return None
-
 async def ensure_alive_proxy(cl, ig, username, notify):
-    """Return proxy that's CONFIRMED IG-reachable. None if nothing works."""
     current = ig.get("proxy")
-
-    if current:
-        if await ig_reachable_via(current, timeout=4):
+    async with ALIVE_LOCK:
+        if current and current in ALIVE_PROXIES:
             return current
-        await notify(f"💀 @{esc(username)} proxy dead (IG unreachable)")
-        await mark_proxy_dead(current)
-        ig["proxy"] = None
+    new_proxy = await get_alive_proxy(timeout=20)
+    if new_proxy:
+        ig["proxy"] = new_proxy
         save_config()
-
-    for rnd in range(3):
-        new_proxy = await find_one_alive_proxy(username)
-        if new_proxy:
-            if await ig_reachable_via(new_proxy, timeout=5):
-                ig["proxy"] = new_proxy
-                save_config()
-                try:
-                    await asyncio.to_thread(cl.set_proxy, new_proxy)
-                except Exception:
-                    pass
-                await notify(f"🌐 @{esc(username)} alive proxy → <code>{esc(new_proxy[:30])}</code>")
-                return new_proxy
-            else:
-                await mark_proxy_dead(new_proxy)
-                await notify(f"❌ @{esc(username)} proxy failed IG-check, next...")
-
+        try:
+            await asyncio.to_thread(cl.set_proxy, new_proxy)
+        except Exception:
+            pass
+        return new_proxy
     return None
 
-async def send_with_proxy_retry(cl, thread_id, msg, ig, username, notify, max_attempts=10):
-    """Send message. On network error: re-verify proxy, swap instantly, retry. No sleep."""
+async def send_with_proxy_retry(cl, thread_id, msg, ig, username, notify, max_attempts=15):
+    """Silent retry — no TG notify, only logs."""
     for attempt in range(1, max_attempts + 1):
-        # Ensure proxy alive + IG-reachable
         proxy = ig.get("proxy")
+        async with ALIVE_LOCK:
+            if not proxy or proxy not in ALIVE_PROXIES:
+                proxy = next(iter(ALIVE_PROXIES), None) if ALIVE_PROXIES else None
         if not proxy:
-            proxy = await ensure_alive_proxy(cl, ig, username, notify)
+            proxy = await get_alive_proxy(timeout=10)
             if not proxy:
-                await notify(f"⏳ @{esc(username)} no proxy (att {attempt}/{max_attempts}) — retrying")
+                await asyncio.sleep(1)
                 continue
-
+            ig["proxy"] = proxy
+            save_config()
+            try:
+                await asyncio.to_thread(cl.set_proxy, proxy)
+            except Exception:
+                pass
+            ig_log(username, "🌐", f"proxy set: {proxy[:25]}")
+        elif ig.get("proxy") != proxy:
+            ig["proxy"] = proxy
+            save_config()
+            try:
+                await asyncio.to_thread(cl.set_proxy, proxy)
+            except Exception:
+                pass
         try:
             await asyncio.to_thread(cl.direct_answer, thread_id, msg)
+            ig_log(username, "✅", f"sent via {proxy[:25]}")
             return True
         except Exception as e:
             err = str(e).lower()
-            network_like = (is_network_error(e)
-                           or "timeout" in err
-                           or "transport" in err
-                           or "curl" in err
-                           or "connect" in err)
-            if not network_like:
+            is_net = (is_network_error(e) or "timeout" in err or "transport" in err
+                     or "curl" in err or "connect" in err or "reset" in err)
+            if not is_net:
                 raise
-
-            await notify(f"🔁 @{esc(username)} send failed (att {attempt}) → checking proxy")
-            alive = await ig_reachable_via(proxy, timeout=4)
-            if not alive:
-                await mark_proxy_dead(proxy)
-                ig["proxy"] = None
-                save_config()
-                await notify(f"💀 @{esc(username)} proxy died mid-send → new one NOW")
-            # no sleep — immediate retry next iteration
-
-    # All proxy attempts failed → DIRECT last resort
-    await notify(f"🔄 @{esc(username)} all {max_attempts} att failed → DIRECT fallback")
+            async with ALIVE_LOCK:
+                ALIVE_PROXIES.pop(proxy, None)
+            ig["proxy"] = None
+            save_config()
+            ig_log(username, "💀", f"proxy dead: {proxy[:25]}")
+    ig_log(username, "⚠️", f"all {max_attempts} attempts failed → DIRECT")
     try:
         await asyncio.to_thread(cl.set_proxy, None)
         await asyncio.to_thread(cl.direct_answer, thread_id, msg)
         ig["proxy"] = None
         save_config()
+        ig_log(username, "✅", "sent DIRECT")
         return True
     except Exception as e:
-        await notify(f"❌ @{esc(username)} DIRECT also failed: <code>{esc(str(e)[:120])}</code>")
+        ig_log(username, "❌", f"DIRECT fail: {str(e)[:60]}")
         return False
 
 # ================= TEMP CLEANUP =================
@@ -642,6 +565,7 @@ async def ig_loop(ig, app):
     owner_id = ig["owner_id"]
     gc_id = ig["gc_id"]
     gc_name = ig.get("gc_name", "?")
+    IG_START_TIME[username] = time.time()
 
     async def notify(text):
         try:
@@ -649,15 +573,12 @@ async def ig_loop(ig, app):
         except Exception:
             pass
 
+    ig_log(username, "🚀", f"loop started → {gc_name}")
+
     consecutive_errors = 0
     cl = make_safe_ig_client()
-    first_send_done = False
-    use_direct = False
 
     try:
-        await notify(f"🔄 @{esc(username)} starting... GC: <b>{esc(gc_name)}</b>")
-
-        # ---- LOGIN via DIRECT IP ----
         try:
             await asyncio.to_thread(cl.set_proxy, None)
         except Exception:
@@ -684,35 +605,41 @@ async def ig_loop(ig, app):
 
         if not session_ok:
             if not ig.get("password"):
-                await notify(f"❌ @{esc(username)} session dead, no password.")
+                ig_log(username, "❌", "session dead, no password")
+                await notify(f"❌ @{esc(username)} session dead — delete & re-add")
                 ig["running"] = False; save_config(); return
             try:
                 await asyncio.to_thread(cl.login, username, ig["password"])
                 ig["settings"] = cl.get_settings(); save_config()
-                await notify(f"🔑 @{esc(username)} login OK (direct IP)")
+                ig_log(username, "🔑", "login OK (direct)")
             except ChallengeRequired:
-                await notify(f"⚠️ @{esc(username)} Challenge required.")
+                ig_log(username, "⚠️", "challenge required")
+                await notify(f"⚠️ @{esc(username)} challenge — delete & re-add")
                 ig["running"] = False; save_config(); return
             except TwoFactorRequired:
-                await notify(f"🔐 @{esc(username)} 2FA needed.")
+                ig_log(username, "🔐", "2FA needed")
+                await notify(f"🔐 @{esc(username)} 2FA needed — delete & re-add")
                 ig["running"] = False; save_config(); return
             except Exception as e:
-                await notify(f"❌ @{esc(username)} login failed: {esc(type(e).__name__)}: {esc(str(e)[:80])}")
+                ig_log(username, "❌", f"login fail: {type(e).__name__}")
+                await notify(f"❌ @{esc(username)} login fail: {esc(type(e).__name__)}")
                 ig["running"] = False; save_config(); return
+        else:
+            ig_log(username, "🔑", "session OK")
 
         IG_CLIENTS[username] = cl
 
-        # ---- Initial proxy setup ----
         proxy = await ensure_alive_proxy(cl, ig, username, notify)
         if not proxy:
-            use_direct = True
             ig["proxy"] = None
             save_config()
             try:
                 await asyncio.to_thread(cl.set_proxy, None)
             except Exception:
                 pass
-            await notify(f"⚠️ @{esc(username)} NO PROXY — DIRECT mode (ban risk!)")
+            ig_log(username, "⚠️", "DIRECT mode (no proxy)")
+        else:
+            ig_log(username, "🌐", f"proxy: {proxy[:25]}")
 
         count = ig.get("stats", {}).get("sent", 0)
         total_errors = ig.get("stats", {}).get("errors_total", 0)
@@ -720,7 +647,8 @@ async def ig_loop(ig, app):
         try:
             thread_id_int = int(gc_id)
         except (ValueError, TypeError):
-            await notify(f"❌ @{esc(username)} invalid GC ID. Delete & re-add.")
+            ig_log(username, "❌", "invalid GC ID")
+            await notify(f"❌ @{esc(username)} invalid GC ID — delete & re-add")
             ig["running"] = False; save_config(); return
 
         while not STOP_FLAG and ig.get("running", True):
@@ -728,11 +656,9 @@ async def ig_loop(ig, app):
                 msg = (f"{random.randint(1, 10**10)} {ig['text']}"
                        if random.choice([True, False])
                        else f"{ig['text']} {random.randint(1, 10**10)}")
-
                 sent = await send_with_proxy_retry(
-                    cl, thread_id_int, msg, ig, username, notify, max_attempts=10
+                    cl, thread_id_int, msg, ig, username, notify, max_attempts=15
                 )
-
                 if not sent:
                     total_errors += 1
                     consecutive_errors += 1
@@ -741,28 +667,23 @@ async def ig_loop(ig, app):
                     save_stats_only()
                     await asyncio.sleep(20)
                     continue
-
                 count += 1
                 consecutive_errors = 0
-                mode = "DIRECT" if ig.get("proxy") is None else "PROXY"
                 ig["stats"] = {"sent": count, "errors_total": total_errors,
                                "errors_current": 0, "last_send": datetime.now().isoformat()}
                 save_stats_only()
-
-                if not first_send_done:
-                    first_send_done = True
-                    await notify(f"✅ @{esc(username)} first msg sent [{mode}] → <b>{esc(gc_name)}</b>")
-
                 await asyncio.sleep(random.uniform(30, 50))
-
             except RateLimitError:
                 consecutive_errors += 1
+                ig_log(username, "⏳", "rate limited, wait 120s")
                 await asyncio.sleep(120)
             except PleaseWaitFewMinutes:
                 consecutive_errors += 1
+                ig_log(username, "⏳", "wait 600s")
                 await asyncio.sleep(600)
             except TwoFactorRequired:
-                await notify(f"🔐 @{esc(username)} 2FA mid-loop.")
+                ig_log(username, "🔐", "2FA mid-loop")
+                await notify(f"🔐 @{esc(username)} 2FA needed")
                 ig["running"] = False; save_config(); return
             except LoginRequired:
                 try:
@@ -774,24 +695,28 @@ async def ig_loop(ig, app):
                             await asyncio.to_thread(cl.set_proxy, ig["proxy"])
                         except Exception:
                             pass
+                    ig_log(username, "🔑", "re-login OK")
                     continue
                 except Exception as e:
-                    await notify(f"❌ @{esc(username)} re-login failed: {esc(type(e).__name__)}")
+                    ig_log(username, "❌", f"re-login fail: {type(e).__name__}")
+                    await notify(f"❌ @{esc(username)} re-login fail")
                     ig["running"] = False; save_config(); return
             except ClientForbiddenError:
-                await notify(f"🚫 @{esc(username)} forbidden.")
+                ig_log(username, "🚫", "forbidden")
+                await notify(f"🚫 @{esc(username)} forbidden")
                 ig["running"] = False; save_config(); return
             except ClientError as e:
                 msg_lower = str(e).lower()
                 if "thread" in msg_lower and "not found" in msg_lower:
-                    await notify(f"❌ @{esc(username)} GC not found.")
+                    ig_log(username, "❌", "GC not found")
+                    await notify(f"❌ @{esc(username)} GC not found")
                     ig["running"] = False; save_config(); return
                 total_errors += 1
                 consecutive_errors += 1
                 ig["stats"]["errors_total"] = total_errors
                 ig["stats"]["errors_current"] = consecutive_errors
                 save_stats_only()
-                await notify(f"⚠️ @{esc(username)} error: <code>{esc(str(e)[:150])}</code>")
+                ig_log(username, "⚠️", f"error: {str(e)[:60]}")
                 await asyncio.sleep(30)
             except Exception as e:
                 total_errors += 1
@@ -799,19 +724,21 @@ async def ig_loop(ig, app):
                 ig["stats"]["errors_total"] = total_errors
                 ig["stats"]["errors_current"] = consecutive_errors
                 save_stats_only()
-                await notify(f"⚠️ @{esc(username)} unexpected: <code>{esc(str(e)[:150])}</code>")
+                ig_log(username, "⚠️", f"unexpected: {str(e)[:60]}")
                 await asyncio.sleep(30)
 
     except asyncio.CancelledError:
-        pass
+        ig_log(username, "⏹", "cancelled")
     except Exception as e:
-        await notify(f"❌ @{esc(username)} fatal: {esc(type(e).__name__)}: {esc(str(e)[:100])}")
+        ig_log(username, "❌", f"fatal: {type(e).__name__}")
+        await notify(f"❌ @{esc(username)} fatal: {esc(type(e).__name__)}")
         ig["running"] = False
         save_config()
     finally:
         await release_proxy_for(username)
         IG_CLIENTS.pop(username, None)
         IG_TASKS.pop(username, None)
+        IG_START_TIME.pop(username, None)
 
 # ================= MENUS & VIEWS =================
 def main_menu(uid):
@@ -838,6 +765,17 @@ def back_menu():
 
 def back_owner():
     return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Owner Panel", callback_data="owner")]])
+
+def fmt_uptime(seconds):
+    seconds = int(seconds)
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    if h:
+        return f"{h}h {m}m {s}s"
+    elif m:
+        return f"{m}m {s}s"
+    return f"{s}s"
 
 async def show_home(q):
     uid = q.from_user.id
@@ -880,35 +818,129 @@ async def cb_tg_view(q):
 async def cb_ig_view(q):
     uid = q.from_user.id
     igs = [ig for ig in CONFIG["ig_ids"] if ig["owner_id"] == uid]
-    text = f"📸 <b>Your IG IDs ({len(igs)}/{MAX_IG_PER_USER})</b>\n\n" if igs else "📸 <b>No IG IDs</b>"
+    text = f"📸 <b>Your IG IDs ({len(igs)}/{MAX_IG_PER_USER})</b>\n\nTap to open dashboard:" if igs else "📸 <b>No IG IDs</b>"
     kb = [[InlineKeyboardButton("➕ Add New IG", callback_data="add_ig")]]
     for idx, ig in enumerate(igs):
         status = "🟢" if ig["username"] in IG_TASKS else "🔴"
-        proxy_status = ig.get("proxy") or "DIRECT"
-        text += (f"{status} <b>@{esc(ig['username'])}</b> → GC: <b>{esc(ig.get('gc_name','?'))}</b>\n"
-                 f"   ├ Sent: <code>{ig.get('stats', {}).get('sent', 0)}</code>\n"
-                 f"   └ Proxy: <code>{esc(proxy_status[:25])}</code>\n\n")
-        if ig["username"] in IG_TASKS:
-            kb.append([InlineKeyboardButton(f"⏹ Stop @{ig['username'][:15]}", callback_data=f"stop_ig:{idx}")])
-        else:
-            kb.append([InlineKeyboardButton(f"▶️ Start @{ig['username'][:15]}", callback_data=f"start_ig:{idx}")])
-        kb.append([InlineKeyboardButton(f"🗑 Delete @{ig['username'][:15]}", callback_data=f"del_ig:{idx}")])
+        label = f"{status} @{ig['username'][:18]} → {ig.get('gc_name','?')[:15]}"
+        kb.append([InlineKeyboardButton(label, callback_data=f"ig_detail:{idx}")])
     kb.append([InlineKeyboardButton("🔙 Menu", callback_data="home")])
     await safe_edit(q, text, reply_markup=InlineKeyboardMarkup(kb))
+
+async def cb_ig_detail(update, context):
+    q = update.callback_query
+    uid = q.from_user.id
+    try:
+        idx = int(q.data.split(":")[1])
+    except (ValueError, IndexError):
+        await q.answer("Bad button", show_alert=True); return
+    igs = [ig for ig in CONFIG["ig_ids"] if ig["owner_id"] == uid]
+    if idx >= len(igs):
+        await q.answer("Stale. Refresh.", show_alert=True); return
+    ig = igs[idx]
+    username = ig["username"]
+    running = username in IG_TASKS
+    status = "🟢 Running" if running else "🔴 Stopped"
+
+    uptime_str = "—"
+    if running and username in IG_START_TIME:
+        uptime_str = fmt_uptime(time.time() - IG_START_TIME[username])
+
+    proxy = ig.get("proxy") or "DIRECT"
+    async with ALIVE_LOCK:
+        pool_alive = len(ALIVE_PROXIES)
+    sent = ig.get("stats", {}).get("sent", 0)
+    errors = ig.get("stats", {}).get("errors_total", 0)
+
+    text = (
+        f"📸 <b>@{esc(username)}</b>\n\n"
+        f"<b>Status:</b> {status}\n"
+        f"<b>GC:</b> {esc(ig.get('gc_name','?'))}\n"
+        f"<b>Uptime:</b> <code>{uptime_str}</code>\n"
+        f"<b>Total Sent:</b> <code>{sent}</code>\n"
+        f"<b>Errors:</b> <code>{errors}</code>\n"
+        f"<b>Proxy:</b> <code>{esc(proxy[:30])}</code>\n"
+        f"<b>Alive Pool:</b> <code>{pool_alive}/{POOL_TARGET}</code>"
+    )
+    rows = []
+    if running:
+        rows.append([InlineKeyboardButton("⏹ Stop", callback_data=f"ig_stop:{idx}")])
+    else:
+        rows.append([InlineKeyboardButton("▶️ Start", callback_data=f"ig_start:{idx}")])
+    rows.append([
+        InlineKeyboardButton("📜 Logs", callback_data=f"ig_logs:{idx}"),
+        InlineKeyboardButton("ℹ️ Info", callback_data=f"ig_info:{idx}"),
+    ])
+    rows.append([InlineKeyboardButton("🗑 Delete", callback_data=f"ig_del:{idx}")])
+    rows.append([InlineKeyboardButton("🔙 Back", callback_data="ig_view")])
+    await safe_edit(q, text, reply_markup=InlineKeyboardMarkup(rows))
+
+async def cb_ig_logs(q):
+    uid = q.from_user.id
+    try:
+        idx = int(q.data.split(":")[1])
+    except (ValueError, IndexError):
+        return
+    igs = [ig for ig in CONFIG["ig_ids"] if ig["owner_id"] == uid]
+    if idx >= len(igs):
+        return
+    ig = igs[idx]
+    logs = IG_LOGS.get(ig["username"], deque())
+    text = f"📜 <b>Last 10 Logs — @{esc(ig['username'])}</b>\n\n"
+    if not logs:
+        text += "<i>No logs yet</i>"
+    else:
+        for line in logs:
+            text += f"<code>{esc(line)}</code>\n"
+    await safe_edit(q, text, reply_markup=InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔙 Back", callback_data=f"ig_detail:{idx}")]
+    ]))
+
+async def cb_ig_info(q):
+    uid = q.from_user.id
+    try:
+        idx = int(q.data.split(":")[1])
+    except (ValueError, IndexError):
+        return
+    igs = [ig for ig in CONFIG["ig_ids"] if ig["owner_id"] == uid]
+    if idx >= len(igs):
+        return
+    ig = igs[idx]
+    async with ALIVE_LOCK:
+        pool_alive = len(ALIVE_PROXIES)
+    text = (
+        f"ℹ️ <b>Info — @{esc(ig['username'])}</b>\n\n"
+        f"<b>GC:</b> {esc(ig.get('gc_name','?'))}\n"
+        f"<b>GC ID:</b> <code>{ig['gc_id']}</code>\n\n"
+        f"<b>Text:</b>\n<code>{esc(ig.get('text','')[:200])}</code>\n\n"
+        f"<b>Added:</b> <code>{(ig.get('added_at') or '?')[:19]}</code>\n"
+        f"<b>Owner:</b> <code>{ig['owner_id']}</code>\n"
+        f"<b>Running flag:</b> <code>{ig.get('running')}</code>\n"
+        f"<b>Proxy:</b> <code>{esc(ig.get('proxy') or 'DIRECT')}</code>\n\n"
+        f"<b>Stats:</b>\n"
+        f"  Sent: <code>{ig.get('stats', {}).get('sent',0)}</code>\n"
+        f"  Total errors: <code>{ig.get('stats', {}).get('errors_total',0)}</code>\n"
+        f"  Current errors: <code>{ig.get('stats', {}).get('errors_current',0)}</code>\n"
+        f"  Last send: <code>{(ig.get('stats', {}).get('last_send') or '—')[:19]}</code>\n\n"
+        f"<b>Pool:</b> <code>{pool_alive}/{POOL_TARGET}</code>"
+    )
+    await safe_edit(q, text, reply_markup=InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔙 Back", callback_data=f"ig_detail:{idx}")]
+    ]))
 
 async def cb_dash(q):
     uid = q.from_user.id
     my_ig = [ig for ig in CONFIG["ig_ids"] if ig["owner_id"] == uid]
     running = [ig for ig in my_ig if ig["username"] in IG_TASKS]
-    alive_proxies = sum(1 for p, (ts, ok) in PROXY_HEALTH.items() if ok)
+    async with ALIVE_LOCK:
+        pool_alive = len(ALIVE_PROXIES)
     text = (f"📊 <b>Dashboard</b>\n\n<b>Your Activity:</b>\n"
             f"📸 IG IDs: <code>{len(my_ig)}/{MAX_IG_PER_USER}</code>\n"
             f"🟢 Running: <code>{len(running)}</code>\n"
             f"📤 Total Sent: <code>{sum(ig.get('stats', {}).get('sent', 0) for ig in my_ig)}</code>\n\n"
             f"<b>Global:</b>\n"
-            f"🌐 Proxy Pool: <code>{len(PROXY_POOL)}</code>\n"
-            f"💚 Alive Proxies: <code>{alive_proxies}</code>\n"
-            f"🔗 In Use: <code>{len(PROXY_ASSIGN)}</code>\n"
+            f"💚 Alive Pool: <code>{pool_alive}/{POOL_TARGET}</code>\n"
+            f"🌐 Candidates: <code>{len(PROXY_POOL)}</code>\n"
             f"👥 Users: <code>{len(CONFIG['users'])}</code>")
     await safe_edit(q, text, reply_markup=back_menu())
 
@@ -933,8 +965,73 @@ async def cb_owner_listbots(q):
         text += f"{i}. {'🟢' if b['token'] in TG_APPS else '🔴'} <code>{esc(b['token'].split(':')[0])}</code>{' 👑' if b.get('is_main') else ''}\n"
     await safe_edit(q, text, reply_markup=back_owner())
 
+async def cb_ig_control(update, context):
+    q = update.callback_query
+    parts = q.data.split(":", 1)
+    action, idx_str = parts
+    uid = q.from_user.id
+    try:
+        idx = int(idx_str)
+    except:
+        await q.answer("Bad button", show_alert=True); return
+    igs = [ig for ig in CONFIG["ig_ids"] if ig["owner_id"] == uid]
+    if idx >= len(igs):
+        await q.answer("Stale. Refresh.", show_alert=True); return
+    ig = igs[idx]
+    username = ig["username"]
+
+    if action == "ig_detail":
+        await q.answer()
+        await cb_ig_detail(update, context)
+    elif action == "ig_logs":
+        await q.answer()
+        await cb_ig_logs(q)
+    elif action == "ig_info":
+        await q.answer()
+        await cb_ig_info(q)
+    elif action == "ig_stop":
+        task = IG_TASKS.pop(username, None)
+        if task:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        ig["running"] = False
+        save_config()
+        await release_proxy_for(username)
+        IG_START_TIME.pop(username, None)
+        await q.answer("⏹ Stopped")
+        await cb_ig_detail(update, context)
+    elif action == "ig_start":
+        existing = IG_TASKS.get(username)
+        if not existing or existing.done():
+            IG_TASKS.pop(username, None)
+            ig["running"] = True
+            save_config()
+            IG_TASKS[username] = asyncio.create_task(ig_loop(ig, context.application))
+            await q.answer("▶️ Started")
+        else:
+            await q.answer("Already running")
+        await cb_ig_detail(update, context)
+    elif action == "ig_del":
+        task = IG_TASKS.pop(username, None)
+        if task:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        await release_proxy_for(username)
+        CONFIG["ig_ids"] = [x for x in CONFIG["ig_ids"] if not (x["username"] == username and x["owner_id"] == uid)]
+        save_config()
+        IG_START_TIME.pop(username, None)
+        IG_LOGS.pop(username, None)
+        await q.answer("🗑 Deleted")
+        await cb_ig_view(q)
+
 # ================= OWNER WIZARDS =================
-async def cb_owner_addbot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cb_owner_addbot(update, context):
     q = update.callback_query
     if q.from_user.id != OWNER_ID:
         await q.answer("Owner only!", show_alert=True)
@@ -944,7 +1041,7 @@ async def cb_owner_addbot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     update_temp(q.from_user.id)
     return S_ADD_BOT
 
-async def owner_addbot_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def owner_addbot_received(update, context):
     if update.effective_user.id != OWNER_ID:
         return ConversationHandler.END
     token = update.message.text.strip()
@@ -964,7 +1061,7 @@ async def owner_addbot_received(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("❌ Failed to start bot. Check the token.", reply_markup=owner_menu())
     return ConversationHandler.END
 
-async def cb_owner_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cb_owner_broadcast(update, context):
     q = update.callback_query
     if q.from_user.id != OWNER_ID:
         await q.answer("Owner only!", show_alert=True)
@@ -974,7 +1071,7 @@ async def cb_owner_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE)
     update_temp(q.from_user.id)
     return S_BROADCAST
 
-async def owner_broadcast_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def owner_broadcast_received(update, context):
     if update.effective_user.id != OWNER_ID:
         return ConversationHandler.END
     text = update.message.text.strip()
@@ -996,7 +1093,7 @@ async def owner_broadcast_received(update: Update, context: ContextTypes.DEFAULT
     return ConversationHandler.END
 
 # ================= USER WIZARDS =================
-async def cb_add_tg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cb_add_tg(update, context):
     q = update.callback_query
     await q.answer()
     if user_tg_count(q.from_user.id) >= MAX_TG_PER_USER:
@@ -1006,7 +1103,7 @@ async def cb_add_tg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     update_temp(q.from_user.id)
     return S_TG_TOKEN
 
-async def tg_token_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def tg_token_received(update, context):
     uid = update.effective_user.id
     token = update.message.text.strip()
     if not is_valid_token(token):
@@ -1022,7 +1119,7 @@ async def tg_token_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Start failed.", reply_markup=main_menu(uid))
     return ConversationHandler.END
 
-async def cb_add_ig(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cb_add_ig(update, context):
     q = update.callback_query
     await q.answer()
     if user_ig_count(q.from_user.id) >= MAX_IG_PER_USER:
@@ -1033,7 +1130,7 @@ async def cb_add_ig(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_edit(q, "📸 <b>Step 1/4</b>\n\nSend IG username:\n\n/cancel to abort.", reply_markup=back_menu())
     return S_IG_USER
 
-async def ig_user_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def ig_user_received(update, context):
     uid = update.effective_user.id
     if uid not in TEMP:
         await update.message.reply_text("⚠️ Expired. /start", reply_markup=main_menu(uid))
@@ -1043,7 +1140,7 @@ async def ig_user_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📸 <b>Step 2/4</b>\n\nSend password:", parse_mode="HTML")
     return S_IG_PASS
 
-async def ig_pass_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def ig_pass_received(update, context):
     uid = update.effective_user.id
     if uid not in TEMP:
         await update.message.reply_text("⚠️ Expired. /start", reply_markup=main_menu(uid))
@@ -1054,7 +1151,6 @@ async def ig_pass_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.delete()
     except:
         pass
-
     msg = await update.message.reply_text("⏳ Logging in (direct IP)...")
     cl = make_safe_ig_client()
     try:
@@ -1080,7 +1176,7 @@ async def ig_pass_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text(f"❌ Login failed: {esc(type(e).__name__)}", parse_mode="HTML")
         return ConversationHandler.END
 
-async def ig_2fa_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def ig_2fa_received(update, context):
     uid = update.effective_user.id
     if uid not in TEMP:
         await update.message.reply_text("⚠️ Expired. /start", reply_markup=main_menu(uid))
@@ -1090,7 +1186,6 @@ async def ig_2fa_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.delete()
     except:
         pass
-
     msg = await update.message.reply_text("⏳ Verifying...")
     cl = TEMP[uid]["client"]
     try:
@@ -1103,7 +1198,7 @@ async def ig_2fa_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text(f"❌ Failed: {esc(type(e).__name__)}", parse_mode="HTML")
         return ConversationHandler.END
 
-async def ig_challenge_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def ig_challenge_received(update, context):
     uid = update.effective_user.id
     if uid not in TEMP:
         await update.message.reply_text("⚠️ Expired. /start", reply_markup=main_menu(uid))
@@ -1113,11 +1208,9 @@ async def ig_challenge_received(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.delete()
     except:
         pass
-
     msg = await update.message.reply_text("⏳ Verifying OTP...")
     cl = TEMP[uid]["client"]
     cl.challenge_code_handler = lambda username, choice: code
-
     try:
         try:
             await asyncio.to_thread(cl.challenge_resolve, cl.last_json)
@@ -1146,7 +1239,6 @@ async def show_gcs(msg, uid):
         TEMP.pop(uid, None)
         TEMP_TS.pop(uid, None)
         return ConversationHandler.END
-
     TEMP[uid]["gcs"] = {}
     kb = []
     for t in threads:
@@ -1157,7 +1249,7 @@ async def show_gcs(msg, uid):
     await msg.edit_text("📸 <b>Step 4/4: Choose GC</b>", reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
     return S_IG_TEXT
 
-async def cb_gc_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cb_gc_pick(update, context):
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
@@ -1179,7 +1271,7 @@ async def cb_gc_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_edit(q, f"✅ GC: <b>{esc(TEMP[uid]['gc_name'])}</b>\n\n💬 Send text:", reply_markup=InlineKeyboardMarkup([]))
     return S_IG_TEXT
 
-async def ig_text_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def ig_text_received(update, context):
     uid = update.effective_user.id
     text = update.message.text.strip()
     if not text:
@@ -1188,20 +1280,17 @@ async def ig_text_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if uid not in TEMP or "gc_id" not in TEMP[uid]:
         await update.message.reply_text("⚠️ Expired. /start")
         return ConversationHandler.END
-
     data = TEMP[uid]
     if any(ig["username"] == data["username"] and ig["owner_id"] == uid for ig in CONFIG["ig_ids"]):
         TEMP.pop(uid, None)
         TEMP_TS.pop(uid, None)
         await update.message.reply_text("⚠️ IG ID already added.", reply_markup=main_menu(uid))
         return ConversationHandler.END
-
     try:
         settings = data["client"].get_settings()
     except Exception as e:
         await update.message.reply_text(f"❌ Failed: {esc(type(e).__name__)}")
         return ConversationHandler.END
-
     ig_entry = {
         "username": data["username"], "password": data["password"], "settings": settings,
         "owner_id": uid, "gc_id": data["gc_id"], "gc_name": data["gc_name"], "text": text,
@@ -1212,7 +1301,6 @@ async def ig_text_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_config()
     TEMP.pop(uid, None)
     TEMP_TS.pop(uid, None)
-
     await update.message.reply_text(
         f"✅ <b>IG @{esc(ig_entry['username'])} Added!</b>\n"
         f"📁 GC: <b>{esc(ig_entry['gc_name'])}</b>\n"
@@ -1222,58 +1310,8 @@ async def ig_text_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     IG_TASKS[ig_entry["username"]] = asyncio.create_task(ig_loop(ig_entry, context.application))
     return ConversationHandler.END
 
-# ================= CONTROLS =================
-async def cb_control(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    parts = q.data.split(":", 1)
-    action, idx_str = parts
-    uid = q.from_user.id
-
-    igs = [ig for ig in CONFIG["ig_ids"] if ig["owner_id"] == uid]
-    try:
-        idx = int(idx_str)
-        ig = igs[idx]
-    except (ValueError, IndexError):
-        await q.answer("Stale button. Refresh.", show_alert=True)
-        return
-
-    await q.answer()
-    username = ig["username"]
-
-    if action == "stop_ig":
-        task = IG_TASKS.pop(username, None)
-        if task:
-            task.cancel()
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                pass
-        ig["running"] = False
-        save_config()
-        await release_proxy_for(username)
-        await cb_ig_view(q)
-    elif action == "start_ig":
-        existing = IG_TASKS.get(username)
-        if not existing or existing.done():
-            IG_TASKS.pop(username, None)
-            ig["running"] = True
-            save_config()
-            IG_TASKS[username] = asyncio.create_task(ig_loop(ig, context.application))
-        await cb_ig_view(q)
-    elif action == "del_ig":
-        task = IG_TASKS.pop(username, None)
-        if task:
-            task.cancel()
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                pass
-        await release_proxy_for(username)
-        CONFIG["ig_ids"] = [x for x in CONFIG["ig_ids"] if not (x["username"] == username and x["owner_id"] == uid)]
-        save_config()
-        await cb_ig_view(q)
-
-async def cb_del_tg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ================= CONTROL (legacy) =================
+async def cb_del_tg(update, context):
     q = update.callback_query
     await q.answer()
     bot_id = q.data.split(":")[1]
@@ -1323,6 +1361,8 @@ async def cb_clean_yes(q):
             except (asyncio.CancelledError, Exception):
                 pass
         await release_proxy_for(ig["username"])
+        IG_LOGS.pop(ig["username"], None)
+        IG_START_TIME.pop(ig["username"], None)
     for b in [x for x in CONFIG["bots"] if x["owner_id"] == uid and not x.get("is_main")]:
         if b["token"] in TG_APPS:
             try:
@@ -1338,7 +1378,7 @@ async def cb_clean_yes(q):
     await safe_edit(q, "🧹 Cleaned!", reply_markup=main_menu(uid))
 
 # ================= ROUTER & WIZARD EXIT =================
-async def cmd_exit_wizard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_exit_wizard(update, context):
     q = update.callback_query
     uid = q.from_user.id
     TEMP.pop(uid, None)
@@ -1366,7 +1406,7 @@ async def cmd_exit_wizard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await cb_owner_broadcast(update, context)
     return ConversationHandler.END
 
-async def cb_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cb_router(update, context):
     q = update.callback_query
     d = q.data
     if d == "owner_listbots":
@@ -1423,7 +1463,7 @@ def build_app(token, owner_id, is_main=False):
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CallbackQueryHandler(cb_router, pattern="^(home|tg_view|ig_view|dash|clean|clean_yes|owner|owner_listbots)$"))
-    app.add_handler(CallbackQueryHandler(cb_control, pattern="^(stop_ig|start_ig|del_ig):.+$"))
+    app.add_handler(CallbackQueryHandler(cb_ig_control, pattern="^(ig_detail|ig_stop|ig_start|ig_logs|ig_info|ig_del):.+$"))
     app.add_handler(CallbackQueryHandler(cb_del_tg, pattern="^del_tg:.+$"))
     return app
 
@@ -1462,9 +1502,7 @@ async def main():
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(default_config(), f, indent=2)
     load_config()
-
     user_proxy_count = load_user_proxies()
-
     main_entries = [b for b in CONFIG["bots"] if b.get("is_main")]
     if not main_entries:
         CONFIG["bots"].insert(0, {"token": MAIN_BOT_TOKEN, "owner_id": OWNER_ID,
@@ -1481,15 +1519,12 @@ async def main():
     print(f"   → {len(CONFIG['ig_ids'])} IG entries in config")
 
     bg_tasks = [
-        asyncio.create_task(proxy_fetcher()),
-        asyncio.create_task(proxy_cleaner()),
+        asyncio.create_task(proxy_maintainer()),
         asyncio.create_task(gh_sync_loop()),
         asyncio.create_task(temp_cleanup_loop()),
     ]
     await gh_bootstrap()
-
     await start_bot(MAIN_BOT_TOKEN, OWNER_ID, is_main=True)
-
     for b in CONFIG["bots"]:
         if not b.get("is_main"):
             await start_bot(b["token"], b["owner_id"], is_main=False)
@@ -1503,13 +1538,13 @@ async def main():
                 if uname in IG_TASKS and not IG_TASKS[uname].done():
                     continue
                 IG_TASKS[uname] = asyncio.create_task(ig_loop(ig, owner_app))
-                print(f"   ✅ @{uname} → GC {ig.get('gc_name','?')} (owner: {ig['owner_id']})")
+                print(f"   ✅ @{uname} → GC {ig.get('gc_name','?')}")
             else:
                 print(f"   ⚠️ @{ig['username']} skipped — no bot for owner {ig['owner_id']}")
                 ig["running"] = False
                 save_config()
 
-    print(f"✅ {len(TG_APPS)} bots running, {len(IG_TASKS)} IG loops active, {len(CONFIG['ig_ids'])} IG IDs in config")
+    print(f"✅ {len(TG_APPS)} bots running, {len(IG_TASKS)} IG loops active")
     try:
         while not STOP_FLAG:
             await asyncio.sleep(60)
