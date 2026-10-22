@@ -1,0 +1,16 @@
+{
+  "version": 7,
+  "last_sync": "2026-10-22T11:42:50.405378",
+  "github_user": "opdjdnfnfnfnfng",
+  "github_repo": "dota-bot-8437109558",
+  "bots": [
+    {
+      "token": "8840376470:AAEdL_11zzJqAnlNYgosAUwbxJrI06lg7RY",
+      "owner_id": 8437109558,
+      "added_at": "2026-10-22T11:42:46.318836",
+      "is_main": true
+    }
+  ],
+  "users": {},
+  "ig_ids": []
+}
