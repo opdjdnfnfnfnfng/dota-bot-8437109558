@@ -1,6 +1,6 @@
 {
   "version": 7,
-  "last_sync": "2026-10-22T13:00:26.367965",
+  "last_sync": "2026-10-22T13:02:08.927736",
   "github_user": "opdjdnfnfnfnfng",
   "github_repo": "dota-bot-8437109558",
   "bots": [
@@ -16,5 +16,25 @@
       "first_seen": "2026-10-22T11:47:50.264657"
     }
   },
-  "ig_ids": []
+  "ig_ids": [
+    {
+      "username": "Chiggerx62",
+      "password": "REDACTED",
+      "settings": {
+        "_redacted": true
+      },
+      "owner_id": 8043772198,
+      "gc_id": "340282366841710301281153493641784130759",
+      "gc_name": "\u3018\ud83c\udf40\u3019\u200e\ud80c\udc83\ud835\udd84\u028a\u1d1b\uaadd\ud80c\udc83\u16d5\uaac0\u0274\u0262\ud80c\udc83H\uaadd\u026a\ud80c\udc83\u3018\ud83c\udf40\u3019",
+      "text": "Hy",
+      "running": true,
+      "proxy": "http://165.154.236.174:80",
+      "added_at": "2026-10-22T13:02:07.048028",
+      "stats": {
+        "sent": 0,
+        "errors_total": 0,
+        "errors_current": 0
+      }
+    }
+  ]
 }
